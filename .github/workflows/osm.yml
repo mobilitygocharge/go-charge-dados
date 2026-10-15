@@ -20,7 +20,7 @@ concurrency:
 jobs:
   osm:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 330     # o script pára de pedir ao fim de 270 min e grava o que tiver
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
