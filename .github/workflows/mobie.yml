@@ -1,0 +1,35 @@
+name: MOBI.E (rede pública de carregamento)
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"   # de 3 em 3 horas: estado (ocupação); inventário completo 1x por dia
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dados
+  cancel-in-progress: false
+
+jobs:
+  mobie:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - name: Recolher MOBI.E
+        run: python scripts/mobie.py
+      - name: Gravar no repositório
+        run: |
+          git config user.name "go-charge-dados"
+          git config user.email "go-charge-dados@users.noreply.github.com"
+          git add data/mobie
+          if git diff --cached --quiet; then echo "Sem alterações."; exit 0; fi
+          git commit -q -m "MOBI.E: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull -q --rebase && git push -q
