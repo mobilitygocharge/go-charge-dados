@@ -1,14 +1,15 @@
 {
- "recolhido": "2026-10-19T13:04:03+00:00",
+ "recolhido": "2026-10-19T13:07:55+00:00",
  "publicationTime": "2026-10-19T10:16:31.406+02:00",
  "bytes": 83321386,
  "sites": 12074,
  "ignorados": 0,
- "points": 35684,
+ "points": 35681,
  "conns": 42857,
  "stations": 12074,
- "dc50": 14110,
- "hpc150": 3973,
+ "kw_sum": 1713888,
+ "dc50": 10974,
+ "hpc150": 3618,
  "operadores_top": [
   [
    "ENDESA X WAY, S.L.",
