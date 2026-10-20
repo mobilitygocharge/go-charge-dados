@@ -1,88 +1,32 @@
 """Locais candidatos do OpenStreetMap em Espanha, nos municípios de prioridade A e B da GO-CHARGE Prospect.
 
-Lista de municípios: data/es/osm_alvos.json (gerado a partir do ranking espanhol; agrupados por província).
-Cada grupo de municípios é pedido ao Overpass pelos limites oficiais do OSM (etiqueta ine:municipio), com
-"foreach" para saber a que município pertence cada local. Município sem limite no OSM → pedido pela caixa
-envolvente (marcado bbox=true; a GO-CHARGE filtra depois pelo limite do IGN).
-Robustez igual à recolha portuguesa: vários servidores e rondas; grupo que falha é repetido por categoria;
-o que mesmo assim falhar mantém os dados da recolha anterior desses municípios.
-
-Uso:  python scripts/osm_es.py            # todas as províncias
-      python scripts/osm_es.py "Madrid"   # só uma província
-Saída: data/es/osm/<provincia>.json   ·   Dados © colaboradores do OpenStreetMap (ODbL)
+Fonte: extratos completos do OpenStreetMap publicados pela Geofabrik (Espanha + Canárias), em vez do Overpass:
+o Overpass público não aguenta pedidos desta dimensão (a 1.ª recolha, a 19/10/2026, só fez 7 províncias em 5 h).
+  1. descarrega spain-latest.osm.pbf e canary-islands-latest.osm.pbf (~1,5 GB, alguns minutos);
+  2. osmium tags-filter fica só com as categorias que interessam;
+  3. pyosmium lê o ficheiro filtrado (pontos, vias e multipolígonos → ponto central);
+  4. cada local entra na província cujo(s) município(s)-alvo o contém pela caixa envolvente
+     (data/es/osm_alvos.json); a GO-CHARGE atribui depois o município exato pelo limite do IGN (bbox=true).
+Uso:  python scripts/osm_es.py            (precisa de osmium-tool e do pacote python osmium)
+Saída: data/es/osm/<provincia>.json   ·   Dados © colaboradores do OpenStreetMap (ODbL), via Geofabrik
 """
-import json, os, re, sys, time, unicodedata, datetime as dt
+import json, os, re, subprocess, sys, time, unicodedata, datetime as dt
 from pathlib import Path
 
-ENDPOINTS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter",
-             "https://overpass.private.coffee/api/interpreter"]
 DATA = Path(os.environ.get("DATA_DIR", "data"))
 ALVOS = DATA / "es" / "osm_alvos.json"
 OUT = DATA / "es" / "osm"
+WORK = Path(os.environ.get("WORK_DIR", "/tmp/osm_es"))
+EXTRACTS = {"spain": "https://download.geofabrik.de/europe/spain-latest.osm.pbf",
+            "canarias": "https://download.geofabrik.de/africa/canary-islands-latest.osm.pbf"}
 TYPES = ["Hotel", "Supermercado", "Restaurante", "Parque", "Empresa", "Concessionário"]
 PARKING_ESTIMATE = {"Hotel": 55, "Supermercado": 90, "Empresa": 75, "Restaurante": 25, "Parque": 120, "Concessionário": 45}
-UA = "go-charge-dados/1.0 (prospecao de mercado; recolha mensal)"
-PAUSE = 4
-ROUNDS = int(os.environ.get("OSM_ROUNDS", "3"))
-ROUND_WAIT = int(os.environ.get("OSM_ROUND_WAIT", "30"))
-DEADLINE = time.time() + 60 * float(os.environ.get("OSM_DEADLINE_MIN", "300"))
-
-SEL = {   # categoria → filtros Overpass ({A} = conjunto de área ou caixa)
-    "Hotel": ['nwr["tourism"~"^(hotel|hostel|guest_house|motel|apartment)$"]["name"]{A};'],
-    "Supermercado": ['nwr["shop"~"^(supermarket|mall|department_store)$"]["name"]{A};'],
-    "Restaurante": ['nwr["amenity"~"^(restaurant|fast_food)$"]["name"]{A};'],
-    "Parque": ['nwr["amenity"="parking"]["access"!~"^(private|no|customers)$"]{A};'],
-    "Empresa": ['nwr["office"]["name"]{A};'],
-    "Concessionário": ['nwr["shop"="car"]["name"]{A};'],
-}
+FILTER = ["nwr/tourism=hotel,hostel,guest_house,motel,apartment", "nwr/shop=supermarket,mall,department_store,car",
+          "nwr/amenity=restaurant,fast_food,parking", "nwr/office"]
 
 def slug(s):
     s = unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
     return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-
-def overpass(query, timeout=330):
-    import requests
-    last = None
-    for rnd in range(ROUNDS):
-        if time.time() > DEADLINE: raise RuntimeError(last or "tempo limite da recolha atingido")
-        if rnd: time.sleep(ROUND_WAIT * rnd)
-        for url in ENDPOINTS:
-            try:
-                r = requests.post(url, data={"data": query}, timeout=timeout, headers={"User-Agent": UA})
-                if r.status_code == 200:
-                    j = r.json(); rem = j.get("remark") or ""
-                    if re.search(r"timed out|runtime error|out of memory", rem, re.I):
-                        last = f"{url}: {rem[:120]}"; continue
-                    return j, url
-                last = f"{url}: HTTP {r.status_code}"
-                if r.status_code == 400: raise RuntimeError(last + " (pedido inválido)")
-            except RuntimeError: raise
-            except Exception as e:
-                last = f"{url}: {str(e)[:120]}"
-            time.sleep(PAUSE)
-    raise RuntimeError(last)
-
-def osm_areas(codes):
-    """Códigos INE que têm limite municipal no OSM (pedido leve: só etiquetas das áreas)."""
-    found = set()
-    for i in range(0, len(codes), 120):
-        part = codes[i:i + 120]
-        q = f'[out:json][timeout:180];area["ine:municipio"~"^({"|".join(part)})"]["admin_level"="8"];out tags;'
-        j, _ = overpass(q); time.sleep(PAUSE)
-        for el in j.get("elements", []):
-            c = str((el.get("tags") or {}).get("ine:municipio", ""))[:5]
-            if c in part: found.add(c)
-    return found
-
-def q_group(codes, cats):
-    body = "".join(s.format(A="(area.a)") for c in cats for s in SEL[c])
-    return (f'[out:json][timeout:300][maxsize:1073741824];area["ine:municipio"~"^({"|".join(codes)})"]["admin_level"="8"]->.all;'
-            f'foreach.all->.a(.a out tags;({body});out center tags;);')
-
-def q_bbox(b, cats):
-    x = "({:.5f},{:.5f},{:.5f},{:.5f})".format(*b)
-    body = "".join(s.format(A=x) for c in cats for s in SEL[c])
-    return f"[out:json][timeout:300];({body});out center tags;"
 
 def capacity(v):
     m = re.search(r"\d+", str(v or ""))
@@ -94,7 +38,8 @@ def category(t):
     if t.get("shop") == "car": return "Concessionário"
     if t.get("amenity") in ("restaurant", "fast_food"): return "Restaurante"
     if t.get("amenity") == "parking": return "Parque"
-    return "Empresa"
+    if t.get("office"): return "Empresa"
+    return None
 
 def url_ok(u):
     u = (u or "").strip()
@@ -102,119 +47,107 @@ def url_ok(u):
     if not re.match(r"^https?://", u): u = "https://" + u
     return u[:300]
 
-def to_candidate(el, muni, bbox_mode):
-    t = el.get("tags") or {}
-    lat = el.get("lat") or (el.get("center") or {}).get("lat")
-    lon = el.get("lon") or (el.get("center") or {}).get("lon")
-    if lat is None or lon is None or not (t.get("name") or t.get("brand") or t.get("operator")): return None
-    ty = category(t); cap = capacity(t.get("capacity") or t.get("capacity:parking"))
-    c = {"id": f"osm:{el['type']}:{el['id']}", "osmType": el["type"], "osmId": el["id"],
-         "name": str(t.get("name") or t.get("brand") or t.get("operator"))[:160], "type": ty,
-         "city": str(t.get("addr:city") or t.get("addr:town") or "")[:90],
-         "area": str(t.get("addr:suburb") or t.get("addr:place") or t.get("addr:street") or "")[:90],
-         "parking": cap if cap is not None else PARKING_ESTIMATE[ty], "parkingSource": "osm" if cap is not None else "estimate",
-         "contact": str(t.get("operator") or "Por identificar")[:120],
-         "phone": str(t.get("phone") or t.get("contact:phone") or "")[:60],
-         "website": url_ok(t.get("website") or t.get("contact:website")),
-         "osmUrl": f"https://www.openstreetmap.org/{el['type']}/{el['id']}",
-         "lat": round(lat, 6), "lon": round(lon, 6), "muni": muni}
-    if bbox_mode: c["bbox"] = True
-    return c
+def wanted(t):
+    ty = category(t)
+    if not ty: return None
+    if ty == "Parque":
+        if t.get("access") in ("private", "no", "customers"): return None
+    elif not t.get("name"): return None
+    if not (t.get("name") or t.get("brand") or t.get("operator")): return None
+    return ty
 
-def fetch_group(codes, cats):
-    """Devolve {código: [candidatos]} para um grupo com limites OSM."""
-    j, url = overpass(q_group(codes, cats))
-    res, cur = {c: [] for c in codes}, None
-    for el in j.get("elements", []):
-        if el["type"] == "area":
-            cur = str((el.get("tags") or {}).get("ine:municipio", ""))[:5]; continue
-        if cur in res:
-            c = to_candidate(el, cur, False)
-            if c: res[cur].append(c)
-    return res, url, (j.get("osm3s") or {}).get("timestamp_osm_base")
+def download(name, url):
+    WORK.mkdir(parents=True, exist_ok=True)
+    f = WORK / f"{name}.osm.pbf"
+    for attempt in range(3):
+        r = subprocess.run(["curl", "-fsSL", "--retry", "3", "-o", str(f), url])
+        if r.returncode == 0 and f.stat().st_size > 1_000_000: return f
+        time.sleep(30)
+    raise RuntimeError(f"download falhou: {url}")
 
-def sync_prov(p, have_area):
-    prev_file = OUT / f"{p['slug']}.json"
-    prev = {}
-    if prev_file.exists():
-        try:
-            for c in json.loads(prev_file.read_text(encoding="utf-8")).get("candidates", []): prev.setdefault(c.get("muni"), []).append(c)
-        except Exception: pass
-    by_muni, servers, failures, ts, done, total, kept = {}, set(), [], None, 0, 0, 0
-    def note(url, t):
-        nonlocal ts
-        servers.add(url.split("/")[2])
-        if t and (not ts or t > ts): ts = t
-    for grp in p["groups"]:
-        grp = [{"d": m[0], "bbox": m[1:5]} for m in grp]
-        area_codes = [m["d"] for m in grp if m["d"] in have_area]
-        box_munis = [m for m in grp if m["d"] not in have_area]
-        if area_codes:
-            total += 1
-            try:
-                res, url, t = fetch_group(area_codes, TYPES); note(url, t); by_muni.update(res); done += 1
-            except Exception as e:
-                print(f"  {p['prov']} · grupo {area_codes[0]}…: falhou ({str(e)[:80]}) — a repetir por categoria")
-                part, ok = {c: [] for c in area_codes}, True
-                for cat in TYPES:
-                    try:
-                        res, url, t = fetch_group(area_codes, [cat]); note(url, t)
-                        for k, v in res.items(): part[k].extend(v)
-                    except Exception as e2:
-                        ok = False; failures.append(f"{area_codes[0]}… {cat}: {e2}"[:200])
-                    time.sleep(PAUSE)
-                if ok: by_muni.update(part); done += 1
-                else:
-                    for k in area_codes:
-                        if prev.get(k): by_muni[k] = prev[k]; kept += len(prev[k])
-                        elif part.get(k): by_muni[k] = part[k]
-            time.sleep(PAUSE)
-        for m in box_munis:
-            total += 1
-            try:
-                j, url = overpass(q_bbox(m["bbox"], TYPES)); note(url, (j.get("osm3s") or {}).get("timestamp_osm_base"))
-                by_muni[m["d"]] = [c for c in (to_candidate(el, m["d"], True) for el in j.get("elements", [])) if c]; done += 1
-            except Exception as e:
-                failures.append(f"{m['d']} (caixa): {e}"[:200])
-                if prev.get(m["d"]): by_muni[m["d"]] = prev[m["d"]]; kept += len(prev[m["d"]])
-            time.sleep(PAUSE)
-    if not servers:
-        raise RuntimeError(f"{p['prov']}: nenhum pedido respondeu — ficheiro anterior mantido")
-    seen, cands = set(), []
-    for k in sorted(by_muni):
-        for c in by_muni[k]:
-            if c["id"] not in seen: seen.add(c["id"]); cands.append(c)
-    out = {"version": 1, "kind": "go-charge-sync", "country": "ES", "zone": f"Espanha · {p['prov']}", "prov": p["prov"],
-           "ccaa": p.get("ccaa", ""), "radius": 1, "categories": TYPES,
-           "syncedAt": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "servers": sorted(servers),
-           "timestampOsmBase": ts, "tilesDone": done, "tilesTotal": total, "failures": failures, "keptFromPrevious": kept,
-           "municipios": sorted(m[0] for g in p["groups"] for m in g), "semLimiteOSM": sorted(m[0] for g in p["groups"] for m in g if m[0] not in have_area),
-           "candidates": cands, "stations": []}
-    OUT.mkdir(parents=True, exist_ok=True)
-    prev_file.write_text(json.dumps(out, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    print(f"{p['prov']}: {len(cands)} candidatos, pedidos completos {done}/{total}, {kept} mantidos da recolha anterior")
+def osm_timestamp(f):
+    r = subprocess.run(["osmium", "fileinfo", "-g", "header.option.osmosis_replication_timestamp", str(f)], capture_output=True, text=True)
+    return r.stdout.strip() or None
 
-def main(argv):
+def collect(pbf):
+    import osmium
+    flt = WORK / (pbf.stem + ".filtered.osm.pbf")
+    subprocess.run(["osmium", "tags-filter", "--overwrite", "-o", str(flt), str(pbf), *FILTER], check=True)
+    out = []
+    class H(osmium.SimpleHandler):
+        def node(self, n):
+            if not n.tags: return
+            t = dict(n.tags); ty = wanted(t)
+            if ty and n.location.valid(): out.append(("node", n.id, n.location.lat, n.location.lon, t, ty))
+        def way(self, w):
+            if not w.tags: return
+            t = dict(w.tags); ty = wanted(t)
+            if not ty: return
+            pts = [(nd.lat, nd.lon) for nd in w.nodes if nd.location.valid()]
+            if pts: out.append(("way", w.id, sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts), t, ty))
+        def area(self, a):
+            if a.from_way(): return          # vias fechadas já tratadas em way()
+            t = dict(a.tags); ty = wanted(t)
+            if not ty: return
+            pts = [(n.lat, n.lon) for ring in a.outer_rings() for n in ring if n.location.valid()]
+            if pts: out.append(("relation", a.orig_id(), sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts), t, ty))
+    H().apply_file(str(flt), locations=True, idx="flex_mem")
+    return out
+
+def main():
     alvos = json.loads(ALVOS.read_text(encoding="utf-8"))["provincias"]
-    provs = [p for p in alvos if not argv or p["prov"] in argv or p["slug"] in argv]
-    codes = sorted(m[0] for p in provs for g in p["groups"] for m in g)
-    try:
-        have_area = osm_areas(codes)
-    except Exception as e:
-        print("Aviso: verificação de limites OSM falhou —", e); have_area = set(codes)
-    print(f"{len(have_area)}/{len(codes)} municípios com limite no OSM")
-    # províncias com recolha mais antiga primeiro (se o tempo acabar, a próxima execução continua pelas outras)
-    def age(p):
-        f = OUT / f"{p['slug']}.json"
-        try: return json.loads(f.read_text(encoding="utf-8")).get("syncedAt", "")
-        except Exception: return ""
-    errors = []
-    for p in sorted(provs, key=age):
-        if time.time() > DEADLINE: errors.append(f"{p['prov']}: sem tempo nesta execução"); continue
-        try: sync_prov(p, have_area)
-        except Exception as e: errors.append(str(e)); print("ERRO", e)
-    for e in errors: print("Pendente:", e)
-    if len(errors) == len(provs): sys.exit(1)
+    boxes = []   # (prov_slug, code, s, w, n, e)
+    for p in alvos:
+        for g in p["groups"]:
+            for m in g: boxes.append((p["slug"], m[0], *m[1:5]))
+    cell = {}
+    for i, b in enumerate(boxes):
+        for la in range(int((b[2] + 90) * 10), int((b[4] + 90) * 10) + 1):
+            for lo in range(int((b[3] + 180) * 10), int((b[5] + 180) * 10) + 1):
+                cell.setdefault((la, lo), []).append(i)
+    per_prov = {p["slug"]: {} for p in alvos}
+    ts_all, sources, errors = [], [], []
+    for name, url in EXTRACTS.items():
+        try:
+            f = download(name, url); ts = osm_timestamp(f); ts_all.append(ts); sources.append(f"{name}: {ts}")
+            items = collect(f)
+            print(f"{name}: {len(items)} locais nas categorias ({ts})", flush=True)
+        except Exception as e:
+            errors.append(f"{name}: {e}"); print("ERRO", name, e, flush=True); continue
+        for typ, oid, lat, lon, t, ty in items:
+            hits = cell.get((int((lat + 90) * 10), int((lon + 180) * 10)), [])
+            for i in hits:
+                b = boxes[i]
+                if b[2] <= lat <= b[4] and b[3] <= lon <= b[5]:
+                    cap = capacity(t.get("capacity") or t.get("capacity:parking"))
+                    c = {"id": f"osm:{typ}:{oid}", "osmType": typ, "osmId": oid,
+                         "name": str(t.get("name") or t.get("brand") or t.get("operator"))[:160], "type": ty,
+                         "city": str(t.get("addr:city") or t.get("addr:town") or "")[:90],
+                         "area": str(t.get("addr:suburb") or t.get("addr:place") or t.get("addr:street") or "")[:90],
+                         "parking": cap if cap is not None else PARKING_ESTIMATE[ty], "parkingSource": "osm" if cap is not None else "estimate",
+                         "contact": str(t.get("operator") or "Por identificar")[:120],
+                         "phone": str(t.get("phone") or t.get("contact:phone") or "")[:60],
+                         "website": url_ok(t.get("website") or t.get("contact:website")),
+                         "osmUrl": f"https://www.openstreetmap.org/{typ}/{oid}",
+                         "lat": round(lat, 6), "lon": round(lon, 6), "muni": b[1], "bbox": True}
+                    per_prov[b[0]].setdefault(c["id"], c)   # pode entrar em duas províncias vizinhas; o limite do IGN decide depois
+    if len(errors) == len(EXTRACTS):
+        print("Nenhum extrato processado — ficheiros anteriores mantidos"); sys.exit(1)
+    ts = max([t for t in ts_all if t] or [None]) if any(ts_all) else None
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    OUT.mkdir(parents=True, exist_ok=True)
+    for p in alvos:
+        if errors and p["ccaa"] == "Canarias" and any(e.startswith("canarias") for e in errors): continue   # mantém o anterior
+        if errors and p["ccaa"] != "Canarias" and any(e.startswith("spain") for e in errors): continue
+        cands = list(per_prov[p["slug"]].values())
+        out = {"version": 1, "kind": "go-charge-sync", "country": "ES", "zone": f"Espanha · {p['prov']}", "prov": p["prov"],
+               "ccaa": p.get("ccaa", ""), "radius": 1, "categories": TYPES, "syncedAt": now,
+               "servers": ["download.geofabrik.de"], "fonte": sources, "timestampOsmBase": ts, "tilesDone": 1, "tilesTotal": 1,
+               "failures": errors, "keptFromPrevious": 0,
+               "municipios": sorted(m[0] for g in p["groups"] for m in g), "semLimiteOSM": [],
+               "candidates": cands, "stations": []}
+        (OUT / f"{p['slug']}.json").write_text(json.dumps(out, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        print(f"{p['prov']}: {len(cands)} locais", flush=True)
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()
