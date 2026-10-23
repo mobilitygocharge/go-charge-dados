@@ -1,20 +1,33 @@
-"""Locais candidatos do OpenStreetMap em Espanha, nos municípios de prioridade A e B da GO-CHARGE Prospect.
+"""Locais candidatos do OpenStreetMap em toda a Espanha (8 131 municípios), para o radar da GO-CHARGE Prospect.
 
 Fonte: extratos completos do OpenStreetMap publicados pela Geofabrik (Espanha + Canárias), em vez do Overpass:
 o Overpass público não aguenta pedidos desta dimensão (a 1.ª recolha, a 19/10/2026, só fez 7 províncias em 5 h).
   1. descarrega spain-latest.osm.pbf e canary-islands-latest.osm.pbf (~1,5 GB, alguns minutos);
   2. osmium tags-filter fica só com as categorias que interessam;
   3. pyosmium lê o ficheiro filtrado (pontos, vias e multipolígonos → ponto central);
-  4. cada local entra na província cujo(s) município(s)-alvo o contém pela caixa envolvente
-     (data/es/osm_alvos.json); a GO-CHARGE atribui depois o município exato pelo limite do IGN (bbox=true).
-Uso:  python scripts/osm_es.py            (precisa de osmium-tool e do pacote python osmium)
+  4. cada local é atribuído ao município pelo limite oficial do IGN (es-atlas, ficheiro MUN_GEOJSON gerado no
+     workflow); locais no mar/na costa a menos de ~1 km ficam no município mais próximo.
+Uso:  MUN_GEOJSON=/tmp/mun.geojson python scripts/osm_es.py   (precisa de osmium-tool, osmium e shapely)
 Saída: data/es/osm/<provincia>.json   ·   Dados © colaboradores do OpenStreetMap (ODbL), via Geofabrik
 """
 import json, os, re, subprocess, sys, time, unicodedata, datetime as dt
 from pathlib import Path
 
 DATA = Path(os.environ.get("DATA_DIR", "data"))
-ALVOS = DATA / "es" / "osm_alvos.json"
+MUN_GEOJSON = os.environ.get("MUN_GEOJSON", "/tmp/mun.geojson")
+PROV = {"01": ("Álava", "País Vasco"), "02": ("Albacete", "Castilla-La Mancha"), "03": ("Alicante", "C. Valenciana"), "04": ("Almería", "Andalucía"),
+        "05": ("Ávila", "Castilla y León"), "06": ("Badajoz", "Extremadura"), "07": ("Illes Balears", "Illes Balears"), "08": ("Barcelona", "Cataluña"),
+        "09": ("Burgos", "Castilla y León"), "10": ("Cáceres", "Extremadura"), "11": ("Cádiz", "Andalucía"), "12": ("Castellón", "C. Valenciana"),
+        "13": ("Ciudad Real", "Castilla-La Mancha"), "14": ("Córdoba", "Andalucía"), "15": ("A Coruña", "Galicia"), "16": ("Cuenca", "Castilla-La Mancha"),
+        "17": ("Girona", "Cataluña"), "18": ("Granada", "Andalucía"), "19": ("Guadalajara", "Castilla-La Mancha"), "20": ("Gipuzkoa", "País Vasco"),
+        "21": ("Huelva", "Andalucía"), "22": ("Huesca", "Aragón"), "23": ("Jaén", "Andalucía"), "24": ("León", "Castilla y León"),
+        "25": ("Lleida", "Cataluña"), "26": ("La Rioja", "La Rioja"), "27": ("Lugo", "Galicia"), "28": ("Madrid", "Madrid"),
+        "29": ("Málaga", "Andalucía"), "30": ("Murcia", "Murcia"), "31": ("Navarra", "Navarra"), "32": ("Ourense", "Galicia"),
+        "33": ("Asturias", "Asturias"), "34": ("Palencia", "Castilla y León"), "35": ("Las Palmas", "Canarias"), "36": ("Pontevedra", "Galicia"),
+        "37": ("Salamanca", "Castilla y León"), "38": ("Santa Cruz de Tenerife", "Canarias"), "39": ("Cantabria", "Cantabria"), "40": ("Segovia", "Castilla y León"),
+        "41": ("Sevilla", "Andalucía"), "42": ("Soria", "Castilla y León"), "43": ("Tarragona", "Cataluña"), "44": ("Teruel", "Aragón"),
+        "45": ("Toledo", "Castilla-La Mancha"), "46": ("Valencia", "C. Valenciana"), "47": ("Valladolid", "Castilla y León"), "48": ("Bizkaia", "País Vasco"),
+        "49": ("Zamora", "Castilla y León"), "50": ("Zaragoza", "Aragón"), "51": ("Ceuta", "Ceuta"), "52": ("Melilla", "Melilla")}
 OUT = DATA / "es" / "osm"
 WORK = Path(os.environ.get("WORK_DIR", "/tmp/osm_es"))
 EXTRACTS = {"spain": "https://download.geofabrik.de/europe/spain-latest.osm.pbf",
@@ -94,19 +107,36 @@ def collect(pbf):
     H().apply_file(str(flt), locations=True, idx="flex_mem")
     return out
 
+def municipalities():
+    from shapely.geometry import shape
+    from shapely.strtree import STRtree
+    g = json.loads(Path(MUN_GEOJSON).read_text(encoding="utf-8"))
+    geoms, codes = [], []
+    for f in g["features"]:
+        c = str(f.get("id") or "")
+        if len(c) != 5 or c[:2] not in PROV: continue
+        gm = shape(f["geometry"]).buffer(0)
+        if gm.is_empty: gm = shape(f["geometry"])
+        if gm.is_empty: continue
+        geoms.append(gm); codes.append(c)
+    return geoms, codes, STRtree(geoms)
+
 def main():
-    alvos = json.loads(ALVOS.read_text(encoding="utf-8"))["provincias"]
-    boxes = []   # (prov_slug, code, s, w, n, e)
-    for p in alvos:
-        for g in p["groups"]:
-            for m in g: boxes.append((p["slug"], m[0], *m[1:5]))
-    cell = {}
-    for i, b in enumerate(boxes):
-        for la in range(int((b[2] + 90) * 10), int((b[4] + 90) * 10) + 1):
-            for lo in range(int((b[3] + 180) * 10), int((b[5] + 180) * 10) + 1):
-                cell.setdefault((la, lo), []).append(i)
-    per_prov = {p["slug"]: {} for p in alvos}
-    ts_all, sources, errors = [], [], []
+    from shapely.geometry import Point
+    geoms, codes, tree = municipalities()
+    print(f"{len(codes)} municípios com limite", flush=True)
+    def muni_of(lat, lon):
+        p = Point(lon, lat)
+        for i in tree.query(p):
+            if geoms[i].contains(p): return codes[i]
+        best, bd = None, 0.01                     # ~1 km: marinas, portos, pontões
+        for i in tree.query(p.buffer(0.01)):
+            d = geoms[i].distance(p)
+            if d < bd: best, bd = codes[i], d
+        return best
+    per_prov = {k: {} for k in PROV}
+    munis_by_prov = {k: sorted(c for c in codes if c[:2] == k) for k in PROV}
+    ts_all, sources, errors, outside = [], [], [], 0
     for name, url in EXTRACTS.items():
         try:
             f = download(name, url); ts = osm_timestamp(f); ts_all.append(ts); sources.append(f"{name}: {ts}")
@@ -115,39 +145,36 @@ def main():
         except Exception as e:
             errors.append(f"{name}: {e}"); print("ERRO", name, e, flush=True); continue
         for typ, oid, lat, lon, t, ty in items:
-            hits = cell.get((int((lat + 90) * 10), int((lon + 180) * 10)), [])
-            for i in hits:
-                b = boxes[i]
-                if b[2] <= lat <= b[4] and b[3] <= lon <= b[5]:
-                    cap = capacity(t.get("capacity") or t.get("capacity:parking"))
-                    c = {"id": f"osm:{typ}:{oid}", "osmType": typ, "osmId": oid,
-                         "name": str(t.get("name") or t.get("brand") or t.get("operator"))[:160], "type": ty,
-                         "city": str(t.get("addr:city") or t.get("addr:town") or "")[:90],
-                         "area": str(t.get("addr:suburb") or t.get("addr:place") or t.get("addr:street") or "")[:90],
-                         "parking": cap if cap is not None else PARKING_ESTIMATE[ty], "parkingSource": "osm" if cap is not None else "estimate",
-                         "contact": str(t.get("operator") or "Por identificar")[:120],
-                         "phone": str(t.get("phone") or t.get("contact:phone") or "")[:60],
-                         "website": url_ok(t.get("website") or t.get("contact:website")),
-                         "osmUrl": f"https://www.openstreetmap.org/{typ}/{oid}",
-                         "lat": round(lat, 6), "lon": round(lon, 6), "muni": b[1], "bbox": True}
-                    per_prov[b[0]].setdefault(c["id"], c)   # pode entrar em duas províncias vizinhas; o limite do IGN decide depois
+            m = muni_of(lat, lon)
+            if not m: outside += 1; continue
+            cap = capacity(t.get("capacity") or t.get("capacity:parking"))
+            c = {"id": f"osm:{typ}:{oid}", "osmType": typ, "osmId": oid,
+                 "name": str(t.get("name") or t.get("brand") or t.get("operator"))[:160], "type": ty,
+                 "city": str(t.get("addr:city") or t.get("addr:town") or "")[:90],
+                 "area": str(t.get("addr:suburb") or t.get("addr:place") or t.get("addr:street") or "")[:90],
+                 "parking": cap if cap is not None else PARKING_ESTIMATE[ty], "parkingSource": "osm" if cap is not None else "estimate",
+                 "contact": str(t.get("operator") or "Por identificar")[:120],
+                 "phone": str(t.get("phone") or t.get("contact:phone") or "")[:60],
+                 "website": url_ok(t.get("website") or t.get("contact:website")),
+                 "osmUrl": f"https://www.openstreetmap.org/{typ}/{oid}",
+                 "lat": round(lat, 6), "lon": round(lon, 6), "muni": m}
+            per_prov[m[:2]].setdefault(c["id"], c)
     if len(errors) == len(EXTRACTS):
         print("Nenhum extrato processado — ficheiros anteriores mantidos"); sys.exit(1)
+    print(f"{outside} locais fora de qualquer município (mar, Andorra, Gibraltar, Portugal, França)", flush=True)
     ts = max([t for t in ts_all if t] or [None]) if any(ts_all) else None
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     OUT.mkdir(parents=True, exist_ok=True)
-    for p in alvos:
-        if errors and p["ccaa"] == "Canarias" and any(e.startswith("canarias") for e in errors): continue   # mantém o anterior
-        if errors and p["ccaa"] != "Canarias" and any(e.startswith("spain") for e in errors): continue
-        cands = list(per_prov[p["slug"]].values())
-        out = {"version": 1, "kind": "go-charge-sync", "country": "ES", "zone": f"Espanha · {p['prov']}", "prov": p["prov"],
-               "ccaa": p.get("ccaa", ""), "radius": 1, "categories": TYPES, "syncedAt": now,
-               "servers": ["download.geofabrik.de"], "fonte": sources, "timestampOsmBase": ts, "tilesDone": 1, "tilesTotal": 1,
-               "failures": errors, "keptFromPrevious": 0,
-               "municipios": sorted(m[0] for g in p["groups"] for m in g), "semLimiteOSM": [],
-               "candidates": cands, "stations": []}
-        (OUT / f"{p['slug']}.json").write_text(json.dumps(out, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        print(f"{p['prov']}: {len(cands)} locais", flush=True)
+    for k, (prov, ccaa) in PROV.items():
+        canarias = k in ("35", "38")
+        if any(e.startswith("canarias" if canarias else "spain") for e in errors): continue   # mantém o ficheiro anterior
+        cands = list(per_prov[k].values())
+        out = {"version": 2, "kind": "go-charge-sync", "country": "ES", "zone": f"Espanha · {prov}", "prov": prov, "ccaa": ccaa,
+               "radius": 1, "categories": TYPES, "syncedAt": now, "servers": ["download.geofabrik.de"], "fonte": sources,
+               "timestampOsmBase": ts, "tilesDone": 1, "tilesTotal": 1, "failures": errors, "keptFromPrevious": 0,
+               "municipios": munis_by_prov[k], "semLimiteOSM": [], "candidates": cands, "stations": []}
+        (OUT / f"{slug(prov)}.json").write_text(json.dumps(out, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        print(f"{prov}: {len(cands)} locais", flush=True)
 
 if __name__ == "__main__":
     main()
