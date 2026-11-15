@@ -1,14 +1,14 @@
 {
- "recolhido": "2026-11-08T05:10:04+00:00",
- "publicationTime": "2026-11-07T10:16:37.704+01:00",
- "bytes": 83506548,
- "sites": 12085,
+ "recolhido": "2026-11-15T05:13:39+00:00",
+ "publicationTime": "2026-11-14T10:16:20.627+01:00",
+ "bytes": 83694275,
+ "sites": 12113,
  "ignorados": 1,
- "points": 35828,
- "conns": 43012,
- "stations": 12085,
- "kw_sum": 1715574,
- "dc50": 10982,
+ "points": 35896,
+ "conns": 43087,
+ "stations": 12113,
+ "kw_sum": 1717266,
+ "dc50": 10999,
  "hpc150": 3619,
  "operadores_top": [
   [
@@ -17,7 +17,7 @@
   ],
   [
    "IBERDROLA CLIENTES S.A.U",
-   2736
+   2769
   ],
   [
    "REPSOL SOLUCIONES ENERGÉTICAS SA",
@@ -45,7 +45,7 @@
   ],
   [
    "Wenea Services Spain, S.L.",
-   210
+   204
   ],
   [
    "FENIE ENERGIA, SA",
